@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-'''
+"""
 Manage Cloudflare zone records
 ==============================
 This state allows to manage records of a particulare Cloudflare zone. It adds
@@ -42,7 +42,6 @@ Each record can have the following fields:
 * `proxied`      - whether zone should be proxied (false by default)
 * `ttl`          - TTL of the record, 1 means auto" (1 by default)
 * `salt_managed` - Whether Salt should manage the record, or skip it (True by default)
-* `priority`     - The priority of the record. Only valid (and required) for MX records
 
 Reference: https://api.cloudflare.com/#dns-records-for-a-zone-properties
 
@@ -51,17 +50,18 @@ with the list of regular expressions that will mark records that are
 managed externally.
 
 This state supports test mode. It makes sense to run it only on one node.
-'''
+"""
 
+from __future__ import absolute_import
+
+import json
+import logging
+import re
 from collections import namedtuple
 
-import re
-import json
-import yaml
 import requests
-import logging
-import salt.exceptions
-
+import salt.ext.six as six
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -69,15 +69,7 @@ logger = logging.getLogger(__name__)
 def manage_zone_records(name, zone):
     managed = Zone(name, zone)
 
-    try:
-        managed.sanity_check()
-    except salt.exceptions.SaltInvocationError as err:
-        return {
-            "name": name,
-            "changes": {},
-            "result": False,
-            "comment": "{0}".format(err)
-        }
+    managed.sanity_check()
 
     diff = managed.diff()
 
@@ -87,8 +79,7 @@ def manage_zone_records(name, zone):
         result["comment"] = "The state of {0} ({1}) is up to date.".format(
             name, zone["zone_id"]
         )
-        result["changes"] = {}
-        result["result"] = None if __opts__["test"] == True else True
+        result["result"] = True
         return result
 
     if __opts__["test"] == True:
@@ -112,18 +103,11 @@ def manage_zone_records(name, zone):
 
 def _changes(diff):
     changes = {}
-    actions = map(lambda op: "{0} {1}".format(op["action"], str(op["record"])), diff)
+    actions = ["{0} {1}".format(op["action"], str(op["record"])) for op in diff]
     if actions:
-        changes['diff'] = "\n".join(actions)
+        changes["diff"] = "\n".join(actions)
     return changes
 
-def validate_record(record):
-    if "name" not in record:
-        raise salt.exceptions.SaltInvocationError("'name' is required")
-    if "content" not in record:
-        raise salt.exceptions.SaltInvocationError("Required field 'content' is missing for entry <{0}>".format(record["name"]))
-    if "type" in record and record["type"] == "MX" and "priority" not in record:
-        raise salt.exceptions.SaltInvocationError("Required field 'priority' is missing for MX entry <{0}>".format(record["name"]))
 
 def record_from_dict(record):
     record.setdefault("type", "A")
@@ -131,13 +115,11 @@ def record_from_dict(record):
     record.setdefault("id", None)
     record.setdefault("ttl", 1)
     record.setdefault("salt_managed", True)
-    priority = record["priority"] if record["type"] == "MX" else None
     return Record(
         record["id"],
         record["type"],
         record["name"],
         record["content"],
-        priority,
         record["proxied"],
         record["ttl"],
         record["salt_managed"],
@@ -146,7 +128,7 @@ def record_from_dict(record):
 
 class Record(
     namedtuple(
-        "Record", ("id", "type", "name", "content", "priority", "proxied", "ttl", "salt_managed")
+        "Record", ("id", "type", "name", "content", "proxied", "ttl", "salt_managed")
     )
 ):
     def pure(self):
@@ -155,7 +137,6 @@ class Record(
             self.type,
             self.name,
             self.content,
-            self.priority,
             self.proxied,
             self.ttl,
             self.salt_managed,
@@ -186,35 +167,12 @@ class Record(
                 "port": int(port),
                 "target": target,
             }
-        if self.type == "CAA":
-            parts = self.content.split(" ")
-            flags, tag, value = parts
-            return {
-                "name": self.name,
-                "flags": int(flags),
-                "tag": tag,
-                "value": value[1:-1],
-            }
 
     def __str__(self):
-        ttl_str = 'auto' if self.ttl == 1 else '{0}s'.format(self.ttl)
-        priority_string = 'priority: {0}, '.format(self.priority) if self.type == "MX" else ''
+        ttl_str = "auto" if self.ttl == 1 else "{0}s".format(self.ttl)
         return "{0} {1} -> '{2}' (proxied: {3}, ttl: {4})".format(
-            self.type, self.name, self.content, priority_string, str(self.proxied).lower(), ttl_str
+            self.type, self.name, self.content, str(self.proxied).lower(), ttl_str
         )
-
-    def json(self):
-        dict = {
-            "type": self.type,
-            "name": self.name,
-            "content": self.content,
-            "proxied": self.proxied,
-            "data": self.data(),
-            "ttl": self.ttl,
-        }
-        if self.type == "MX":
-            dict["priority"] = self.priority
-        return dict
 
 
 class Zone(object):
@@ -242,21 +200,14 @@ class Zone(object):
 
     def __init__(self, name, zone):
         self.name = name
-        self.api_token = zone.get("api_token", None)
-        self.auth_email = zone.get("auth_email", None)
-        self.auth_key = zone.get("auth_key", None)
+        self.auth_email = zone["auth_email"]
+        self.auth_key = zone["auth_key"]
         self.zone_id = zone["zone_id"]
         self.records = zone["records"]
-        self.exclude = zone.get('exclude', [])
-        
-        if not self.api_token and not (self.auth_email and self.auth_key):
-            raise Exception("Either api_token or auth_email and auth_key must be provided")
+        self.exclude = zone.get("exclude", [])
 
     def _request(self, uri, method="GET", json=None):
-        if self.api_token:
-            headers = {"Authorization": "Bearer {0}".format(self.api_token)}
-        else:
-            headers = {"X-Auth-Email": self.auth_email, "X-Auth-Key": self.auth_key}
+        headers = {"X-Auth-Email": self.auth_email, "X-Auth-Key": self.auth_key}
 
         logger.info("Sending request: {0} {1} data: {2}".format(method, uri, json))
 
@@ -282,7 +233,14 @@ class Zone(object):
         self._request(
             self.ADD_RECORD_URI_TEMPLATE.format(zone_id=self.zone_id),
             method="POST",
-            json=record.json(),
+            json={
+                "type": record.type,
+                "name": record.name,
+                "content": record.content,
+                "proxied": record.proxied,
+                "data": record.data(),
+                "ttl": record.ttl,
+            },
         )
 
     def _remove_record(self, record):
@@ -299,7 +257,14 @@ class Zone(object):
                 zone_id=self.zone_id, record_id=record.id
             ),
             method="PUT",
-            json=record.json(),
+            json={
+                "type": record.type,
+                "name": record.name,
+                "content": record.content,
+                "proxied": record.proxied,
+                "data": record.data(),
+                "ttl": record.ttl,
+            },
         )
 
     def sanity_check(self):
@@ -395,12 +360,10 @@ class Zone(object):
 
             page += 1
 
-        return records.values()
+        return list(records.values())
 
     def desired(self):
-        for record in self.records:
-            validate_record(record)
-        return map(lambda record: record_from_dict(record.copy()), self.records)
+        return [record_from_dict(record.copy()) for record in self.records]
 
     def diff(self):
         existing_tuples = {
@@ -412,7 +375,7 @@ class Zone(object):
             for record in self.desired()
         }
         desired_salt_managed = {
-            record.name: record.salt_managed for record in self.desired()
+            (record.type, record.name): record.salt_managed for record in self.desired()
         }
 
         changes = []
@@ -423,7 +386,7 @@ class Zone(object):
             changes.append({"action": self.ACTION_ADD, "record": desired_tuples[key]})
 
         for key in set(existing_tuples).difference(desired_tuples):
-            if key[1] in desired_salt_managed and desired_salt_managed[key[1]] == False:
+            if not desired_salt_managed.get((key[0], key[1]), True):
                 continue
             changes.append(
                 {"action": self.ACTION_REMOVE, "record": existing_tuples[key]}
@@ -443,7 +406,6 @@ class Zone(object):
                         desired_tuples[key].type,
                         desired_tuples[key].name,
                         desired_tuples[key].content,
-                        priority=desired_tuples[key].priority,
                         proxied=desired_tuples[key].proxied,
                         ttl=desired_tuples[key].ttl,
                         salt_managed=True,
@@ -470,7 +432,7 @@ class Zone(object):
             for op in sorted(ops, key=lambda op: order[op["action"]]):
                 result.append(op)
 
-        for name, ops in groups["primary"].items():
+        for name, ops in six.iteritems(groups["primary"]):
             if any(op["record"].type == "CNAME" for op in ops):
                 # need to remove before adding
                 append_in_order(ops, self.SPECIAL_APPLY_ORDER)
@@ -478,8 +440,13 @@ class Zone(object):
                 # nothing special about these records
                 append_in_order(ops, self.REGULAR_APPLY_ORDER)
 
-        for name, ops in groups["rest"].items():
-            append_in_order(ops, self.REGULAR_APPLY_ORDER)
+        for name, ops in six.iteritems(groups["rest"]):
+            if any(op["record"].type == "SRV" for op in ops):
+                # need to remove before adding, because of record limit
+                append_in_order(ops, self.SPECIAL_APPLY_ORDER)
+            else:
+                # nothing special about these records
+                append_in_order(ops, self.REGULAR_APPLY_ORDER)
 
         return result
 
